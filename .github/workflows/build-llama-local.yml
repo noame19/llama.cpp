@@ -1,15 +1,19 @@
 name: Build llama.cpp (ubuntu 22.04 + CUDA 12.6, glibc 2.35 target)
 
-# Produces two artifacts, both runnable on the target box
-# (Debian 12 / glibc 2.36 / GLIBCXX 3.4.30 / NVIDIA driver 615.71, Tesla T10 sm_75):
-#   1. <ref>-linux-x64-cuda-full.tar.gz         -> every llama.cpp binary
-#   2. <ref>-linux-x64-cuda-server-only.tar.gz  -> only llama-server
+# Two artifacts, both runnable on the target box:
+#   Debian 12 / glibc 2.36 / GLIBCXX 3.4.30 / x86-64 AVX2 / NVIDIA driver 615.71.09
+#   (Tesla T10 16GB, sm_75), no CUDA toolkit and no libcublas on the box.
 #
-# The official prebuilt "ubuntu-cuda" packages are built inside ubuntu 24.04
-# (glibc 2.38 + GLIBCXX 3.4.32) and therefore cannot run on the target box.
-# This workflow builds inside ubuntu 22.04 (glibc 2.35 + GLIBCXX 3.4.30) and
-# links the CUDA runtime and cuBLAS statically, so no cudart bundle and no
-# system CUDA toolkit is required at run time - only the driver's libcuda.so.1.
+#   1. llama-<ref>-linux-x64-cuda-full.tar.gz        -> every llama.cpp executable
+#   2. llama-<ref>-linux-x64-cuda-server-only.tar.gz -> only llama-server (+ the
+#                                                       shared libs it dlopens)
+#
+# Why this image: the official ubuntu-cuda prebuilt packages are compiled inside
+# ubuntu 24.04 (glibc 2.38 + GLIBCXX 3.4.32) and ship cudart/cublas as a separate
+# 594 MB bundle, so they cannot run on the target box. ubuntu 22.04 gives glibc
+# 2.35 / GLIBCXX 3.4.30 (<= the target), and cudart + cuBLAS are linked
+# statically, so the only CUDA runtime dependency left is the driver's
+# libcuda.so.1, which the box already has.
 
 on:
   workflow_dispatch:
@@ -39,6 +43,7 @@ jobs:
       image: nvidia/cuda:12.6.2-devel-ubuntu22.04
     steps:
       - name: Make sure git exists inside the container
+        shell: bash
         run: |
           if ! command -v git >/dev/null 2>&1; then
             apt-get update
@@ -53,14 +58,16 @@ jobs:
           fetch-depth: 1
 
       - name: Show build environment
+        shell: bash
         run: |
           echo "== container =="
-          cat /etc/os-release | head -3
+          head -3 /etc/os-release
           ldd --version | head -1
           echo "== nvcc =="
           nvcc --version | tail -2
 
       - name: Install toolchain (gcc-12 + recent cmake)
+        shell: bash
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -74,9 +81,10 @@ jobs:
 
       - name: Link CUDA runtime + cuBLAS statically
         # ggml only uses the static CUDA runtime / static cuBLAS when GGML_STATIC=ON,
-        # but GGML_STATIC=ON also adds a global "-static" link option which cannot
+        # but GGML_STATIC=ON also adds a global "-static" link option, which cannot
         # work together with the dynamic libcuda.so driver stub. So flip just that
-        # one branch: self-contained binaries, dynamic glibc / libstdc++ / libgomp.
+        # one branch: self-contained CUDA deps, dynamic glibc / libstdc++ / libgomp.
+        shell: bash
         run: |
           python3 - <<'PY'
           import pathlib, sys
@@ -91,67 +99,118 @@ jobs:
           grep -n "patched: always static" ggml/src/ggml-cuda/CMakeLists.txt
 
       - name: Configure
+        shell: bash
         run: |
+          # b11870 -> build number 11870, so the server picks up the matching
+          # prebuilt web UI from the ggml-org HF bucket
+          BUILD_NUMBER="$(echo "$REF" | sed -n 's/^b\([0-9][0-9]*\)$/\1/p')"
+          echo "LLAMA_BUILD_NUMBER=${BUILD_NUMBER:-0}"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-12 \
             -DCMAKE_CXX_COMPILER=g++-12 \
             -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
             -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.cuda_archs }}" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
             -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_NUMBER="${BUILD_NUMBER:-0}" \
             -DLLAMA_OPENSSL=ON
 
       - name: Build every target
+        shell: bash
         run: cmake --build build --parallel
 
       - name: Smoke test + compatibility report
+        shell: bash
+        env:
+          # the container has no GPU and no driver: point the loader at the CUDA
+          # driver stub so the runtime check below can actually execute
+          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs
         run: |
           echo "== binaries =="
           ls -la build/bin
           echo "== --version =="
-          ./build/bin/llama-cli --version || true
-          ./build/bin/llama-server --version || true
+          ./build/bin/llama-cli --version
+          ./build/bin/llama-server --version
           echo "== dynamic dependencies of llama-server =="
-          ldd build/bin/llama-server | sort || true
-          echo "== required glibc symbols =="
-          objdump -T build/bin/llama-server | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -3
-          echo "== required GLIBCXX symbols =="
-          objdump -T build/bin/llama-server | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -3
+          ldd build/bin/llama-server | sort
+          echo "== RPATH =="
+          readelf -d build/bin/llama-server | grep -E "RPATH|RUNPATH" || true
+          echo "== required glibc symbols (llama-server + all its .so) =="
+          for f in build/bin/llama-server build/bin/lib*.so.*; do
+            objdump -T "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?'
+          done | sort -Vu | tail -3
+          echo "== required GLIBCXX symbols (llama-server + all its .so) =="
+          for f in build/bin/llama-server build/bin/lib*.so.*; do
+            objdump -T "$f" 2>/dev/null | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+(\.[0-9]+)?'
+          done | sort -Vu | tail -3
+          echo "== local box for comparison: glibc 2.36 / GLIBCXX 3.4.30 =="
 
       - name: Package both artifacts
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs
         run: |
           set -euo pipefail
           FULL="llama-${REF}-linux-x64-cuda-full"
           SRV="llama-${REF}-linux-x64-cuda-server-only"
-          mkdir -p "dist/$FULL" "dist/$SRV"
+          mkdir -p dist
+
+          # smaller payload: drop symbol tables (Release build, no -g)
+          find build/bin -maxdepth 1 -type f ! -name '*.so*' -exec strip --strip-unneeded {} + || true
+          find build/bin -maxdepth 1 -type f -name '*.so.*' -exec strip --strip-unneeded {} + || true
+
+          echo "== size after strip =="
+          du -sh build/bin; du -sh build/bin/libggml-cuda.so.0.27.0 || true
 
           info() {
             echo "llama.cpp build info"
             echo "  source        : https://github.com/ggml-org/llama.cpp @ ${REF}"
-            echo "  commit        : $(git rev-parse HEAD)"
+            echo "  commit        : $(git -c safe.directory='*' rev-parse HEAD)"
             echo "  build image   : nvidia/cuda:12.6.2-devel-ubuntu22.04 (glibc $(ldd --version | head -1 | awk '{print $NF}'))"
             echo "  compiler      : $(g++-12 --version | head -1)"
             echo "  cuda toolkit  : $(nvcc --version | tail -2 | head -1 | sed 's/^ *//')"
             echo "  cuda archs    : ${{ inputs.cuda_archs }}"
             echo "  cmake         : $(cmake --version | head -1)"
-            echo "  cuda linking  : cudart/cublas STATIC, libcuda.so.1 from driver at run time"
-            echo "  target box    : Debian 12, glibc 2.36, GLIBCXX 3.4.30, driver 615.71.09, Tesla T10 (sm_75)"
+            echo "  cuda linking  : cudart + cublas STATIC, NCCL off, only libcuda.so.1 at run time"
+            echo "  rpath         : \$ORIGIN (binaries and libs must stay in the same directory)"
+            echo "  target box    : Debian 12, glibc 2.36, GLIBCXX 3.4.30, AVX2, driver 615.71.09, Tesla T10 (sm_75)"
             echo
             echo "run: ./llama-server -m model.gguf --host 0.0.0.0 --port 8080 -ngl 99"
           }
 
-          cp -a build/bin/. "dist/$FULL/"
-          cp LICENSE "dist/$FULL/" 2>/dev/null || true
-          cp build/bin/llama-server "dist/$SRV/llama-server"
-          info > "dist/$FULL/BUILD-INFO.txt"
-          info > "dist/$SRV/BUILD-INFO.txt"
-          ldd build/bin/llama-server | sort > "dist/$FULL/ldd.txt" || true
+          # ---- 1) full: every executable + every shared lib
+          mkdir -p full
+          cp -a build/bin/. full/
+          cp -a LICENSE full/ 2>/dev/null || true
+          info > full/BUILD-INFO.txt
+          ldd build/bin/llama-server | sort > full/ldd.txt
+          tar -czf "dist/$FULL.tar.gz" -C full .
+          ls -la full | head -20
 
-          tar -C "dist/$FULL" -czf "dist/$FULL.tar.gz" .
-          tar -C "dist/$SRV" -czf "dist/$SRV.tar.gz" .
+          # ---- 2) server only: llama-server + exactly the libs it needs
+          mkdir -p srv
+          cp -a build/bin/llama-server srv/
+          ldd build/bin/llama-server | awk '/=> \//{print $3}' | while read -r lib; do
+            case "$lib" in
+              */build/bin/*) cp -a "$lib" srv/ ;;
+            esac
+          done
+          ls -la srv
+          info > srv/BUILD-INFO.txt
+          ldd build/bin/llama-server | sort > srv/ldd.txt
+          tar -czf "dist/$SRV.tar.gz" -C srv .
+
+          # ---- verify the server-only payload is complete when relocated
+          rm -rf /tmp/relocated && mkdir -p /tmp/relocated
+          tar -xzf "dist/$SRV.tar.gz" -C /tmp/relocated
+          ( cd /tmp/relocated && ./llama-server --version )
+
           ls -lh dist/*.tar.gz
 
       - name: Upload full build (all binaries)
