@@ -1,0 +1,96 @@
+name: Publish build artifacts as a public release
+
+# Actions artifacts always require a logged-in GitHub session, so this workflow
+# copies the two tarballs of a finished build run into a normal GitHub Release.
+# Release assets are plain public files: anyone can download them without an
+# account, and they never expire (artifacts expire after 30 days).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Actions run id that produced the artifacts"
+        required: true
+        default: "40173979433"
+      tag:
+        description: "release tag to create/publish into"
+        required: true
+        default: "b11870-local"
+
+permissions:
+  contents: write
+
+env:
+  REF: ${{ inputs.tag }}
+
+jobs:
+  release:
+    name: publish ${{ inputs.tag }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Download artifacts of run ${{ inputs.run_id }}
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+          merge-multiple: true
+
+      - name: Show payload
+        run: |
+          ls -lh dist
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Self-built `llama.cpp` for a Debian 12 / glibc 2.36 box (no CUDA toolkit installed).
+
+          - source: https://github.com/ggml-org/llama.cpp at tag `b11870` (commit `74bca39`)
+          - build image: `nvidia/cuda:12.6.2-devel-ubuntu22.04` -> needs only **glibc 2.34** and **GLIBCXX 3.4.30**
+          - CUDA runtime and cuBLAS are linked **statically**, so the only GPU dependency is the driver's `libcuda.so.1`
+          - NCCL disabled, `RUNPATH=$ORIGIN` (keep the binaries and the `.so` files in the same directory)
+          - built for `CMAKE_CUDA_ARCHITECTURES=75-real;89-real` (Tesla T10 / Turing and RTX 40xx), AVX2 CPU baseline
+
+          ### Assets
+
+          | file | content |
+          | --- | --- |
+          | `llama-b11870-linux-x64-cuda-full.tar.gz` | every llama.cpp executable + all shared libs |
+          | `llama-b11870-linux-x64-cuda-server-only.tar.gz` | only `llama-server` + the shared libs it loads |
+
+          ### Usage
+
+          ```bash
+          tar xzf llama-b11870-linux-x64-cuda-server-only.tar.gz -C llama-server-b11870
+          cd llama-server-b11870
+          ./llama-server -m /path/to/model.gguf --host 0.0.0.0 --port 8080 -ngl 99
+          ```
+
+          `BUILD-INFO.txt` inside each tarball records the exact toolchain, and `SHA256SUMS.txt` sits next to the assets.
+          EOF
+          cat notes.md
+
+      - name: Create release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $REF already exists, uploading (clobbering) assets"
+            gh release upload "$REF" dist/*.tar.gz dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$REF" dist/*.tar.gz dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "llama.cpp b11870 - linux x64 CUDA 12.6 (glibc 2.36 compatible)" \
+              --notes-file notes.md
+          fi
+
+      - name: Show public asset URLs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$REF" --repo "$GITHUB_REPOSITORY" --json url,assets \
+            --jq '"release: \(.url)", (.assets[] | "asset: \(.name)  \(.size) bytes  \(.url)")'
