@@ -120,11 +120,17 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Smoke test + compatibility report
-        env:
-          # the container has no GPU and no driver: point the loader at the CUDA
-          # driver stub so the runtime check below can actually execute
-          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs
         run: |
+          # The container has no GPU and no driver. The binaries only need the
+          # driver's libcuda.so.1 at load time, so expose the CUDA driver *stub*
+          # under that exact soname name and put it on the loader path.
+          mkdir -p /tmp/cudastub
+          STUB="$(find /usr/local/cuda* -type f -name 'libcuda.so' -path '*stubs*' 2>/dev/null | head -1)"
+          echo "driver stub: ${STUB:-<not found>}"
+          [ -n "$STUB" ] && ln -sf "$STUB" /tmp/cudastub/libcuda.so.1 || true
+          ls -la /tmp/cudastub
+          export LD_LIBRARY_PATH="/tmp/cudastub:${LD_LIBRARY_PATH:-}"
+
           echo "== binaries =="
           ls -la build/bin
           echo "== --version =="
@@ -145,10 +151,12 @@ jobs:
           echo "== local box for comparison: glibc 2.36 / GLIBCXX 3.4.30 =="
 
       - name: Package both artifacts
-        env:
-          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs
         run: |
           set -eu
+          mkdir -p /tmp/cudastub
+          STUB="$(find /usr/local/cuda* -type f -name 'libcuda.so' -path '*stubs*' 2>/dev/null | head -1)"
+          [ -n "$STUB" ] && ln -sf "$STUB" /tmp/cudastub/libcuda.so.1 || true
+          export LD_LIBRARY_PATH="/tmp/cudastub:${LD_LIBRARY_PATH:-}"
           FULL="llama-${REF}-linux-x64-cuda-full"
           SRV="llama-${REF}-linux-x64-cuda-server-only"
           mkdir -p dist
@@ -186,13 +194,11 @@ jobs:
           ls -la full | head -20
 
           # ---- 2) server only: llama-server + exactly the libs it needs
+          # llama-server is a thin launcher: it needs the backend .so files that
+          # sit next to it (RPATH=$ORIGIN), so they travel with it.
           mkdir -p srv
           cp -a build/bin/llama-server srv/
-          ldd build/bin/llama-server | awk '/=> \//{print $3}' | while read -r lib; do
-            case "$lib" in
-              */build/bin/*) cp -a "$lib" srv/ ;;
-            esac
-          done
+          cp -a build/bin/lib*.so* srv/
           ls -la srv
           info > srv/BUILD-INFO.txt
           ldd build/bin/llama-server | sort > srv/ldd.txt
@@ -202,6 +208,11 @@ jobs:
           rm -rf /tmp/relocated && mkdir -p /tmp/relocated
           tar -xzf "dist/$SRV.tar.gz" -C /tmp/relocated
           ( cd /tmp/relocated && ./llama-server --version )
+          if ldd /tmp/relocated/llama-server | grep "not found"; then
+            echo "ERROR: server-only payload has unresolved libraries"; exit 1
+          fi
+          echo "OK: server-only payload is complete when relocated"
+          du -sh srv full; ls -la srv | head -20
 
           ls -lh dist/*.tar.gz
 
